@@ -1,0 +1,190 @@
+name: Update from Upstream Release
+
+on:
+  schedule:
+    # Run every Monday at 8 AM UTC
+    - cron: '0 8 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  pull-requests: write
+  contents: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_repo: ${{ steps.detect-upstream.outputs.upstream_repo }}
+      upstream_branch: ${{ steps.detect-upstream.outputs.upstream_branch }}
+      has_upstream: ${{ steps.detect-upstream.outputs.has_upstream }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Detect upstream remote
+        id: detect-upstream
+        run: |
+          # Check if there's an upstream remote
+          if git config --get remote.upstream.url > /dev/null; then
+            UPSTREAM_URL=$(git config --get remote.upstream.url)
+            echo "has_upstream=true" >> $GITHUB_OUTPUT
+            echo "upstream_url=$UPSTREAM_URL" >> $GITHUB_OUTPUT
+            
+            # Extract owner/repo from URL
+            if [[ $UPSTREAM_URL =~ github\.com[:/]([^/]+)/([^/]+?)(\.git)?$ ]]; then
+              UPSTREAM_REPO="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+              UPSTREAM_REPO=${UPSTREAM_REPO%.git}
+              echo "upstream_repo=$UPSTREAM_REPO" >> $GITHUB_OUTPUT
+              
+              # Try to detect the default branch
+              UPSTREAM_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null | grep -oP '(?<=refs/heads/)[^ ]+' || echo "main")
+              echo "upstream_branch=${UPSTREAM_BRANCH:-main}" >> $GITHUB_OUTPUT
+              
+              echo "✅ Detected upstream: $UPSTREAM_REPO (branch: ${UPSTREAM_BRANCH:-main})"
+            else
+              echo "has_upstream=false" >> $GITHUB_OUTPUT
+              echo "⚠️  Upstream URL format not recognized"
+            fi
+          else
+            echo "has_upstream=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  No upstream remote configured"
+          fi
+
+  update-from-upstream:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.has_upstream == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Fetch upstream
+        run: |
+          git remote add upstream $(git config --get remote.origin.url | sed 's#meatflavourdev#${{ needs.check-upstream.outputs.upstream_repo }}#') || true
+          git fetch upstream ${{ needs.check-upstream.outputs.upstream_branch }} || git fetch upstream main || git fetch upstream master || true
+      
+      - name: Check for updates
+        id: check-updates
+        run: |
+          # Get latest upstream commit info
+          UPSTREAM_COMMIT=$(git rev-parse upstream/${{ needs.check-upstream.outputs.upstream_branch }} 2>/dev/null || git rev-parse upstream/main 2>/dev/null || git rev-parse upstream/master 2>/dev/null || echo "")
+          
+          if [ -z "$UPSTREAM_COMMIT" ]; then
+            echo "❌ Could not determine upstream branch"
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          LOCAL_COMMIT=$(git rev-parse HEAD)
+          
+          echo "📊 Comparing commits:"
+          echo "   Local:    $LOCAL_COMMIT"
+          echo "   Upstream: $UPSTREAM_COMMIT"
+          
+          if [ "$UPSTREAM_COMMIT" != "$LOCAL_COMMIT" ]; then
+            echo "✅ Updates available"
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "upstream_commit=$UPSTREAM_COMMIT" >> $GITHUB_OUTPUT
+            
+            # Get commit message/tag info
+            COMMIT_MSG=$(git log -1 --pretty=%B $UPSTREAM_COMMIT | head -1)
+            echo "commit_msg=$COMMIT_MSG" >> $GITHUB_OUTPUT
+          else
+            echo "ℹ️  Already up to date"
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create branch and merge
+        if: steps.check-updates.outputs.has_updates == 'true'
+        run: |
+          BRANCH_NAME="chore/upstream-update-$(date +%Y%m%d)"
+          
+          git checkout -b $BRANCH_NAME
+          git merge -X theirs --no-edit upstream/${{ needs.check-upstream.outputs.upstream_branch }} || git merge -X theirs --no-edit upstream/main || git merge -X theirs --no-edit upstream/master || true
+          
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_ENV
+      
+      - name: Create Pull Request
+        if: steps.check-updates.outputs.has_updates == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          commit-message: "chore: update from upstream ${{ needs.check-upstream.outputs.upstream_repo }}"
+          title: "⬆️ Update from upstream (${{ needs.check-upstream.outputs.upstream_repo }})"
+          body: |
+            ## 📦 Upstream Repository Update
+            
+            **Upstream Repository:** `${{ needs.check-upstream.outputs.upstream_repo }}`
+            **Branch:** `${{ needs.check-upstream.outputs.upstream_branch }}`
+            
+            ### Changes
+            This PR merges the latest changes from the upstream repository.
+            
+            - Latest commit from upstream has been merged
+            - **Note:** This uses a "theirs" merge strategy - upstream changes take precedence
+            
+            ### Review Checklist
+            - [ ] Review code changes for breaking changes
+            - [ ] Run tests to ensure compatibility
+            - [ ] Check for any custom modifications that may be lost
+            - [ ] Verify the application still works as expected
+            
+            ### Merge Instructions
+            This PR is automatically created by the weekly upstream update workflow.
+            Please review thoroughly before merging.
+            
+            ---
+            
+            Automated by: Update from Upstream Release workflow
+            Triggered: ${{ github.event_name }}
+            Repository: `${{ github.repository }}`
+          branch: chore/upstream-update-${{ github.run_number }}
+          delete-branch: true
+          labels: 'upstream,dependencies'
+      
+      - name: Send update notification
+        if: steps.check-updates.outputs.has_updates == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.EMAIL_SERVER }}
+          server_port: ${{ secrets.EMAIL_PORT }}
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "⬆️ Upstream Update Available - ${{ github.repository }}"
+          to: jeremy@meatflavour.dev
+          from: "GitHub Actions <${{ secrets.EMAIL_FROM }}>"
+          body: |
+            # Upstream Repository Update
+            
+            **Repository:** ${{ github.repository }}
+            **Upstream:** ${{ needs.check-upstream.outputs.upstream_repo }}
+            
+            A new update from the upstream repository is available!
+            
+            - **Latest Commit:** ${{ steps.check-updates.outputs.upstream_commit }}
+            - **Message:** ${{ steps.check-updates.outputs.commit_msg }}
+            
+            A pull request has been created for review:
+            ${{ github.server_url }}/${{ github.repository }}/pulls
+            
+            Please review the changes and test thoroughly before merging.
+            
+            ---
+            Automated by: Update from Upstream Release workflow
+      
+      - name: No upstream configured
+        if: needs.check-upstream.outputs.has_upstream == 'false'
+        run: |
+          echo "ℹ️  No upstream remote configured for this repository"
+          echo "   To enable upstream updates, add an upstream remote:"
+          echo "   git remote add upstream <upstream-repo-url>"
