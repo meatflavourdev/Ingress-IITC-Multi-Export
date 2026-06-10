@@ -5,7 +5,8 @@
 # ============================================================================
 # Deploys the dependabot-auto-merge.yml workflow to ALL user-owned repositories
 # Sets up required email secrets for Gmail notifications
-# 
+# Handles pagination to ensure all repositories are processed
+#
 # Prerequisites:
 #   - GitHub CLI (gh) installed and authenticated: https://cli.github.com/
 #   - jq installed: https://stedolan.github.io/jq/install/
@@ -29,7 +30,7 @@ set -e
 # Configuration
 # ============================================================================
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="2.0.0"
 WORKFLOW_SOURCE_REPO="meatflavourdev/Ingress-IITC-Multi-Export"
 WORKFLOW_FILE=".github/workflows/dependabot-auto-merge.yml"
 WORKFLOW_COMMIT_MSG="🤖 Add Dependabot auto-merge workflow with email notifications"
@@ -48,6 +49,8 @@ SINGLE_REPO=""
 LOG_DIR="./deployment-logs"
 LOG_FILE="$LOG_DIR/deployment-$(date +%Y%m%d-%H%M%S).log"
 PROGRESS_FILE="$LOG_DIR/progress-$(date +%Y%m%d-%H%M%S).txt"
+REPOS_PER_PAGE=100
+MAX_PAGES=10  # Safeguard to prevent infinite loops
 
 # ============================================================================
 # Colors for Terminal Output
@@ -94,7 +97,7 @@ print_banner() {
     echo -e "${PURPLE}"
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║   Dependabot Auto-Merge Workflow - Batch Deployment Script     ║"
-    echo "║   Version: $SCRIPT_VERSION                                         ║"
+    echo "║   Version: $SCRIPT_VERSION (with Pagination Support)                ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -212,29 +215,51 @@ download_workflow() {
 }
 
 get_all_repositories() {
-    log INFO "Fetching all repositories for user: $USER"
+    log INFO "Fetching all repositories with pagination support..."
     
     local all_repos=""
     local page=1
+    local total_fetched=0
     
-    while true; do
-        log DEBUG "Fetching page $page of repositories..."
+    while [ $page -le $MAX_PAGES ]; do
+        log DEBUG "Fetching page $page of repositories (records $((($page-1)*$REPOS_PER_PAGE+1))-$(($page*$REPOS_PER_PAGE)))..."
         
-        page_repos=$(gh repo list "$USER" --limit 100 --json name --jq '.[].name' --no-header 2>/dev/null)
+        # Fetch repositories for the current page
+        page_repos=$(gh repo list "$USER" \
+            --limit $REPOS_PER_PAGE \
+            --json name \
+            --jq '.[].name' \
+            --no-header \
+            2>/dev/null || echo "")
         
-        if [ -z "$page_repos" ]; then
+        # Count how many repos were returned
+        page_count=$(echo "$page_repos" | grep -v '^$' | wc -l)
+        
+        if [ $page_count -eq 0 ]; then
+            log DEBUG "No more repositories found. Stopping pagination."
             break
         fi
         
+        log DEBUG "Page $page returned $page_count repositories"
         all_repos="$all_repos$page_repos"$'\n'
+        total_fetched=$((total_fetched + page_count))
+        
+        # If we got fewer repos than requested, we've reached the end
+        if [ $page_count -lt $REPOS_PER_PAGE ]; then
+            log DEBUG "Final page reached (returned $page_count repos, expected $REPOS_PER_PAGE)"
+            break
+        fi
+        
         page=$((page + 1))
         
-        # GitHub API rate limiting - add small delay
-        sleep 0.5
+        # Rate limiting - small delay between API calls
+        sleep 0.3
     done
     
     # Remove empty lines and duplicates
     echo "$all_repos" | grep -v '^$' | sort -u
+    
+    log INFO "Total repositories fetched: $total_fetched across $((page-1)) pages"
 }
 
 deploy_to_repository() {
@@ -261,8 +286,8 @@ deploy_to_repository() {
                 EMAIL_FROM) secret_value="$EMAIL_FROM" ;;
             esac
             
-            if ! gh secret set "$secret" --body "$secret_value" -R "$repo_full_name" 2>&1 | grep -q ""; then
-                log DEBUG "Set secret $secret in $repo_full_name"
+            if ! gh secret set "$secret" --body "$secret_value" -R "$repo_full_name" 2>&1 > /dev/null; then
+                log WARN "Could not set secret $secret in $repo_full_name (may already exist or insufficient permissions)"
             fi
         done
         
@@ -302,6 +327,8 @@ main() {
     echo "   Workflow File: $WORKFLOW_FILE"
     echo "   Email: $EMAIL_USERNAME"
     echo "   Mode: $([ "$DEPLOY_MODE" = true ] && echo "DEPLOY" || echo "DRY-RUN")"
+    echo "   Repos Per Page: $REPOS_PER_PAGE"
+    echo "   Max Pages: $MAX_PAGES"
     echo ""
     
     download_workflow
@@ -312,7 +339,7 @@ main() {
         log INFO "Deploying to single repository: $SINGLE_REPO"
         mapfile -t REPO_ARRAY <<< "$SINGLE_REPO"
     else
-        echo -e "${BLUE}📦 Fetching repositories...${NC}"
+        echo -e "${BLUE}📦 Fetching all repositories...${NC}"
         repos=$(get_all_repositories)
         mapfile -t REPO_ARRAY <<< "$repos"
     fi
@@ -328,6 +355,7 @@ main() {
     FAILED=0
     SKIPPED=0
     declare -a FAILED_REPOS
+    declare -a FAILED_REASONS
     
     # Deploy to each repository
     echo -e "${BLUE}🚀 Deployment Progress:${NC}"
@@ -339,16 +367,24 @@ main() {
         
         printf "\r${BLUE}[$CURRENT/$TOTAL_REPOS]${NC} ${PERCENTAGE}%% | Processing..."
         
-        if deploy_to_repository "$REPO_NAME"; then
+        result=$(deploy_to_repository "$REPO_NAME" 2>&1)
+        exit_code=$?
+        
+        if [ $exit_code -eq 0 ]; then
             DEPLOYED=$((DEPLOYED + 1))
             printf "\r${BLUE}[$CURRENT/$TOTAL_REPOS]${NC} ${PERCENTAGE}%% | ${GREEN}✓${NC} $REPO_NAME                    "
-        elif [ $? -eq 2 ]; then
+        elif [ $exit_code -eq 2 ]; then
             SKIPPED=$((SKIPPED + 1))
+            printf "\r${BLUE}[$CURRENT/$TOTAL_REPOS]${NC} ${PERCENTAGE}%% | ${YELLOW}⊘${NC} $REPO_NAME (skipped)          "
         else
             FAILED=$((FAILED + 1))
             FAILED_REPOS+=("$REPO_NAME")
+            FAILED_REASONS+=("$result")
             printf "\r${BLUE}[$CURRENT/$TOTAL_REPOS]${NC} ${PERCENTAGE}%% | ${RED}✗${NC} $REPO_NAME                    "
         fi
+        
+        # Rate limiting
+        sleep 0.1
     done
     
     echo ""
@@ -375,8 +411,11 @@ main() {
     
     if [ ${#FAILED_REPOS[@]} -gt 0 ]; then
         echo -e "${RED}Failed repositories:${NC}"
-        for repo in "${FAILED_REPOS[@]}"; do
-            echo -e "   ${RED}• $repo${NC}"
+        for j in "${!FAILED_REPOS[@]}"; do
+            echo -e "   ${RED}• ${FAILED_REPOS[$j]}${NC}"
+            if [ -n "${FAILED_REASONS[$j]}" ]; then
+                echo -e "      ${CYAN}Reason: ${FAILED_REASONS[$j]}${NC}"
+            fi
         done
         echo ""
     fi
