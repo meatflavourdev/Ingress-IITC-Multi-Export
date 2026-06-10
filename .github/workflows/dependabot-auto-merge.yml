@@ -1,0 +1,238 @@
+name: Auto-merge Dependabot PRs
+
+on:
+  schedule:
+    # Run every Monday at 9 AM UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  pull-requests: write
+  contents: write
+  issues: write
+
+jobs:
+  auto-merge-dependabot:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Process Dependabot PRs
+        uses: actions/github-script@v7
+        id: process-prs
+        with:
+          script: |
+            const { data: pullRequests } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              creator: 'dependabot[bot]'
+            });
+            
+            const results = {
+              total: pullRequests.length,
+              security_merged: [],
+              security_pending: [],
+              major_minor: [],
+              patch_skipped: [],
+              failed_checks: [],
+              errors: []
+            };
+            
+            console.log(`\n📦 Found ${pullRequests.length} open Dependabot PRs\n`);
+            
+            for (const pr of pullRequests) {
+              try {
+                console.log(`\n🔍 Processing PR #${pr.number}: ${pr.title}`);
+                
+                // Parse PR title to extract version info and update type
+                const titleLower = pr.title.toLowerCase();
+                const isSecurityUpdate = titleLower.includes('security') || titleLower.includes('vulnerability');
+                
+                // Check if it's a major/minor or patch update
+                const versionMatch = pr.title.match(/(\d+\.\d+\.\d+)/);
+                let updateType = 'unknown';
+                
+                if (titleLower.includes('major')) {
+                  updateType = 'major';
+                } else if (titleLower.includes('minor')) {
+                  updateType = 'minor';
+                } else if (titleLower.includes('patch') || versionMatch) {
+                  updateType = 'patch';
+                }
+                
+                console.log(`  Type: ${updateType} | Security: ${isSecurityUpdate}`);
+                
+                // For non-security updates, skip and categorize
+                if (!isSecurityUpdate) {
+                  console.log(`  ⏭️  Skipping non-security ${updateType} update (manual review required)`);
+                  results.major_minor.push({
+                    number: pr.number,
+                    title: pr.title,
+                    type: updateType,
+                    url: pr.html_url
+                  });
+                  continue;
+                }
+                
+                // Security update - check CI status
+                console.log(`  🔐 Security update detected`);
+                
+                // Get commit SHA for status checks
+                const commitSha = pr.head.sha;
+                
+                // Check for failed status checks
+                const { data: checkRuns } = await github.rest.checks.listForRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: commitSha
+                });
+                
+                const failedChecks = checkRuns.check_runs.filter(
+                  check => check.conclusion === 'failure'
+                );
+                
+                const pendingChecks = checkRuns.check_runs.filter(
+                  check => check.status === 'in_progress' || check.status === 'queued'
+                );
+                
+                if (failedChecks.length > 0) {
+                  console.log(`  ❌ ${failedChecks.length} failed checks:`);
+                  failedChecks.forEach(check => {
+                    console.log(`     - ${check.name}: ${check.conclusion}`);
+                  });
+                  results.failed_checks.push({
+                    number: pr.number,
+                    title: pr.title,
+                    checks: failedChecks.map(c => `${c.name} (${c.conclusion})`),
+                    url: pr.html_url
+                  });
+                  continue;
+                }
+                
+                if (pendingChecks.length > 0) {
+                  console.log(`  ⏳ ${pendingChecks.length} pending checks:`);
+                  pendingChecks.forEach(check => {
+                    console.log(`     - ${check.name}`);
+                  });
+                  results.security_pending.push({
+                    number: pr.number,
+                    title: pr.title,
+                    pending_checks: pendingChecks.map(c => c.name),
+                    url: pr.html_url
+                  });
+                  continue;
+                }
+                
+                // All checks passed - merge security update
+                console.log(`  ✅ All checks passed`);
+                
+                // Check for existing approval
+                const { data: reviews } = await github.rest.pulls.listReviews({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number
+                });
+                
+                const approvedReview = reviews.some(review => review.state === 'APPROVED');
+                
+                if (!approvedReview) {
+                  console.log(`  👍 Approving PR #${pr.number}`);
+                  await github.rest.pulls.createReview({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pr.number,
+                    event: 'APPROVE',
+                    body: 'Auto-approved security update by dependabot-auto-merge workflow'
+                  });
+                }
+                
+                // Merge the PR
+                console.log(`  🔀 Merging PR #${pr.number}`);
+                await github.rest.pulls.merge({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  merge_method: 'squash',
+                  commit_title: `🔐 ${pr.title}`,
+                  commit_message: `Automated security update merge\n\n${pr.body || ''}`
+                });
+                
+                console.log(`  ✨ Successfully merged PR #${pr.number}`);
+                results.security_merged.push({
+                  number: pr.number,
+                  title: pr.title,
+                  url: pr.html_url
+                });
+                
+              } catch (error) {
+                console.log(`  ⚠️  Error processing PR #${pr.number}: ${error.message}`);
+                results.errors.push({
+                  number: pr.number,
+                  title: pr.title,
+                  error: error.message
+                });
+              }
+            }
+            
+            // Save results for email step
+            core.setOutput('results', JSON.stringify(results));
+            
+            // Log summary
+            console.log(`\n${'='.repeat(60)}`);
+            console.log(`SUMMARY`);
+            console.log(`${'='.repeat(60)}`);
+            console.log(`✨ Security updates merged: ${results.security_merged.length}`);
+            console.log(`⏳ Security updates pending CI: ${results.security_pending.length}`);
+            console.log(`❌ Security updates with failed checks: ${results.failed_checks.length}`);
+            console.log(`⏭️  Major/Minor updates requiring review: ${results.major_minor.length}`);
+            console.log(`⚠️  Errors encountered: ${results.errors.length}`);
+            console.log(`${'='.repeat(60)}\n`);
+            
+            return results;
+      
+      - name: Send email report
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.EMAIL_SERVER }}
+          server_port: ${{ secrets.EMAIL_PORT }}
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "🤖 Dependabot Auto-Merge Report - ${{ github.repository }}"
+          to: jeremy@meatflavour.dev
+          from: "GitHub Actions <${{ secrets.EMAIL_FROM }}>"
+          body: |
+            # Dependabot Auto-Merge Report
+            
+            **Repository:** ${{ github.repository }}
+            **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            **Timestamp:** ${{ github.event.repository.pushed_at || now() }}
+            
+            ## Summary
+            
+            - ✨ **Security updates merged:** ${{ fromJson(steps.process-prs.outputs.results).security_merged.length }}
+            - ⏳ **Security updates pending CI:** ${{ fromJson(steps.process-prs.outputs.results).security_pending.length }}
+            - ❌ **Security updates with failed checks:** ${{ fromJson(steps.process-prs.outputs.results).failed_checks.length }}
+            - ⏭️  **Major/Minor updates requiring review:** ${{ fromJson(steps.process-prs.outputs.results).major_minor.length }}
+            - ⚠️  **Errors:** ${{ fromJson(steps.process-prs.outputs.results).errors.length }}
+            
+            ## Merged Security Updates
+            
+            ${{ fromJson(steps.process-prs.outputs.results).security_merged.length > 0 && format('') || 'None' }}
+            ${{ join(fromJson(steps.process-prs.outputs.results).security_merged.*.title, '\n') }}
+            
+            ${{ fromJson(steps.process-prs.outputs.results).security_pending.length > 0 && format('\n## Pending Security Updates (Waiting for CI)\n\n{}', join(fromJson(steps.process-prs.outputs.results).security_pending.*.title, '\n')) || '' }}
+            
+            ${{ fromJson(steps.process-prs.outputs.results).failed_checks.length > 0 && format('\n## Security Updates with Failed Checks\n\n{}', join(fromJson(steps.process-prs.outputs.results).failed_checks.*.title, '\n')) || '' }}
+            
+            ${{ fromJson(steps.process-prs.outputs.results).major_minor.length > 0 && format('\n## Updates Requiring Manual Review\n\n{}', join(fromJson(steps.process-prs.outputs.results).major_minor.*.title, '\n')) || '' }}
+            
+            ${{ fromJson(steps.process-prs.outputs.results).errors.length > 0 && format('\n## Errors\n\n{}', join(fromJson(steps.process-prs.outputs.results).errors.*.error, '\n')) || '' }}
+            
+            ---
+            
+            View full workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          content_type: text/markdown
