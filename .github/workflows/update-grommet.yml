@@ -1,0 +1,137 @@
+name: Update Grommet Dependency
+
+on:
+  schedule:
+    # Run every Monday at 8 AM UTC (before Dependabot merges at 9 AM)
+    - cron: '0 8 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  pull-requests: write
+  contents: write
+
+jobs:
+  update-grommet:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Check for Grommet updates
+        id: check-grommet
+        run: |
+          # Get current Grommet version from package.json
+          CURRENT_VERSION=$(npm list grommet 2>/dev/null | grep grommet | head -1 | grep -oE '@[0-9]+\.[0-9]+\.[0-9]+' | cut -c2- || echo "not-installed")
+          
+          # Get latest Grommet version from npm registry
+          LATEST_VERSION=$(npm view grommet version 2>/dev/null || echo "unknown")
+          
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          
+          echo "📦 Current Grommet version: $CURRENT_VERSION"
+          echo "📦 Latest Grommet version: $LATEST_VERSION"
+          
+          # Check if update is available
+          if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ] && [ "$LATEST_VERSION" != "unknown" ]; then
+            echo "update_available=true" >> $GITHUB_OUTPUT
+            echo "✅ Update available: $CURRENT_VERSION → $LATEST_VERSION"
+          else
+            echo "update_available=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  No update needed"
+          fi
+      
+      - name: Update Grommet
+        if: steps.check-grommet.outputs.update_available == 'true'
+        run: |
+          npm update grommet --save
+          echo "✨ Grommet updated to ${{ steps.check-grommet.outputs.latest_version }}"
+      
+      - name: Install dependencies
+        if: steps.check-grommet.outputs.update_available == 'true'
+        run: npm ci
+      
+      - name: Run tests
+        if: steps.check-grommet.outputs.update_available == 'true'
+        continue-on-error: true
+        run: npm test 2>&1 | head -100
+      
+      - name: Create Pull Request
+        if: steps.check-grommet.outputs.update_available == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          commit-message: "chore: update grommet to ${{ steps.check-grommet.outputs.latest_version }}"
+          title: "⬆️ Upgrade Grommet to ${{ steps.check-grommet.outputs.latest_version }}"
+          body: |
+            ## 📦 Grommet Dependency Update
+            
+            **Current Version:** `${{ steps.check-grommet.outputs.current_version }}`
+            **New Version:** `${{ steps.check-grommet.outputs.latest_version }}`
+            
+            ### Changes
+            - Updated `grommet` to latest release
+            - Dependencies updated via `npm update`
+            
+            ### Testing
+            - Review test results above
+            - Verify UI components render correctly
+            - Check for any breaking changes
+            
+            ### Merge Instructions
+            This PR is automatically created by the weekly update workflow.
+            Please review changes before merging to ensure compatibility.
+            
+            ---
+            
+            Automated by: Update Grommet Dependency workflow
+            Triggered: ${{ github.event_name }} at ${{ github.event.repository.pushed_at || now() }}
+          branch: chore/grommet-update-${{ steps.check-grommet.outputs.latest_version }}
+          delete-branch: true
+          labels: 'dependencies,grommet'
+      
+      - name: Comment on PR
+        if: steps.check-grommet.outputs.update_available == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            console.log('✅ Grommet update PR created');
+            console.log(`   Current: ${{ steps.check-grommet.outputs.current_version }}`);
+            console.log(`   Latest: ${{ steps.check-grommet.outputs.latest_version }}`);
+      
+      - name: Send update notification
+        if: steps.check-grommet.outputs.update_available == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.EMAIL_SERVER }}
+          server_port: ${{ secrets.EMAIL_PORT }}
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "📦 Grommet Update Available - ${{ github.repository }}"
+          to: jeremy@meatflavour.dev
+          from: "GitHub Actions <${{ secrets.EMAIL_FROM }}>"
+          body: |
+            # Grommet Dependency Update
+            
+            **Repository:** ${{ github.repository }}
+            
+            A new version of Grommet is available!
+            
+            - **Current Version:** ${{ steps.check-grommet.outputs.current_version }}
+            - **Latest Version:** ${{ steps.check-grommet.outputs.latest_version }}
+            
+            A pull request has been created for review:
+            ${{ github.server_url }}/${{ github.repository }}/pulls
+            
+            Please review the changes and test thoroughly before merging.
+            
+            ---
+            Automated by: Update Grommet Dependency workflow
